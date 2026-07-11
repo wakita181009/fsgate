@@ -127,7 +127,7 @@ impl FsGate {
     }
 
     #[tool(
-        description = "Replace exactly one occurrence of old_str with new_str in a note. Never overwrites the whole file."
+        description = "Replace exactly one occurrence of old_str with new_str in a note. Fails safely if the file changes concurrently."
     )]
     async fn patch_note(
         &self,

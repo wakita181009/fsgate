@@ -65,12 +65,24 @@ impl AppState {
         f(&guard)
     }
 
-    /// Mutates the credentials under lock, then persists the result atomically.
+    /// Mutates a clone of the credentials, persists it, then publishes it in
+    /// memory. A failed save therefore cannot leave memory ahead of disk.
     /// The closure must not perform blocking I/O or `.await`.
     pub fn mutate_creds<T>(&self, f: impl FnOnce(&mut Credentials) -> T) -> Result<T> {
+        self.mutate_creds_if(|creds| (f(creds), true))
+    }
+
+    /// Like `mutate_creds`, but lets the closure report that no state changed.
+    /// No-op outcomes avoid rewriting `credentials.json`, which is important for
+    /// rejecting abusive DCR requests once the client registry is full.
+    pub fn mutate_creds_if<T>(&self, f: impl FnOnce(&mut Credentials) -> (T, bool)) -> Result<T> {
         let mut guard = self.inner.creds.lock().expect("credentials mutex poisoned");
-        let out = f(&mut guard);
-        state::save(&self.inner.config.state_dir, &guard)?;
+        let mut next = guard.clone();
+        let (out, changed) = f(&mut next);
+        if changed {
+            state::save(&self.inner.config.state_dir, &next)?;
+            *guard = next;
+        }
         Ok(out)
     }
 }

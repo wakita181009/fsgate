@@ -194,6 +194,7 @@ MCP tool call → Authorization: Bearer <access>
 - [x] WebAuthn `userVerification: required` — `webauthn-rs` passkey ceremonies use
       `UserVerificationPolicy::Required` (registration & authentication) by default
 - [x] `redirect_uri` exact-match; DCR restricts to https + Claude domains — `oauth::authorize::validate`, `oauth::dcr`
+- [x] DCR state is bounded and retry-safe: identical metadata reuses a client; new registrations are capped and rate-limited — `oauth::dcr`, `session::Sessions`
 - [x] Access tokens short-lived (15 min); refresh tokens rotate + are revocable (server-stored, single-use) — `oauth::token`
 - [x] `aud` (RFC 8707) binds tokens to this resource — no cross-server replay — `auth::jwt`, `oauth::bearer`
 - [ ] Serve only over the tunnel's TLS; never advertise a non-https origin — deployment (config enforces https origin)

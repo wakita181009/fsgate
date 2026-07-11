@@ -106,7 +106,7 @@ v1 surface. Deliberately small.
 | `read_note(path)` | Return frontmatter + body |
 | `list_notes(prefix?)` | List files under a prefix |
 | `create_note(path, content)` | Create a new file (fails if it exists) |
-| `patch_note(path, old_str, new_str)` | Targeted replacement — never a blind full-file overwrite |
+| `patch_note(path, old_str, new_str)` | Targeted replacement; fails safely if the file changes concurrently |
 
 `patch_note` rather than `write_note` is intentional: a full overwrite driven by an LLM on a phone, against a file it only partially read, is how you lose work.
 
@@ -246,7 +246,7 @@ Stack:
 |---|---|
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata (`S256` only) |
-| `POST /register` | RFC 7591 Dynamic Client Registration (https + Claude domains only) |
+| `POST /register` | RFC 7591 Dynamic Client Registration (Claude domains only; deduplicated, bounded, rate-limited) |
 | `GET /enroll` · `POST /enroll/{start,verify}` | Passkey enrollment (password-gated, self-locking) |
 | `GET /authorize` · `POST /authorize/{start,finish,password}` | Owner login → authorization code |
 | `POST /token` | Code + PKCE → JWT access token + rotating refresh token |

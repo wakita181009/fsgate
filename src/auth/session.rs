@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,8 @@ const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// there is exactly one legitimate password.
 const MAX_PASSWORD_FAILURES: u32 = 5;
 const PASSWORD_LOCKOUT: Duration = Duration::from_secs(5 * 60);
+const DCR_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DCR_REGISTRATIONS_PER_WINDOW: usize = 10;
 
 /// OAuth parameters captured at `/authorize` and carried through the passkey
 /// ceremony until an authorization code is minted.
@@ -56,6 +58,7 @@ pub struct Sessions {
     auth_codes: Mutex<HashMap<String, (AuthCode, Instant)>>,
     refresh_tokens: Mutex<HashMap<String, (Refresh, Instant)>>,
     password_attempts: Mutex<PasswordAttempts>,
+    dcr_registrations: Mutex<VecDeque<Instant>>,
 }
 
 /// Brute-force guard state for recovery-password checks.
@@ -186,6 +189,31 @@ impl Sessions {
         guard.failures = 0;
         guard.locked_until = None;
     }
+
+    // --- Dynamic client registration rate limit ---
+
+    /// Records a state-creating DCR request, or returns how long the caller must
+    /// wait. Reuse of existing registrations is checked before this method and
+    /// does not consume the small single-user registration budget.
+    pub fn allow_dcr_registration(&self) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut attempts = self.dcr_registrations.lock().unwrap();
+        while attempts
+            .front()
+            .is_some_and(|started| now.duration_since(*started) >= DCR_RATE_WINDOW)
+        {
+            attempts.pop_front();
+        }
+
+        if attempts.len() >= MAX_DCR_REGISTRATIONS_PER_WINDOW {
+            let retry_at =
+                *attempts.front().expect("rate-limited queue is non-empty") + DCR_RATE_WINDOW;
+            return Err(retry_at.saturating_duration_since(now));
+        }
+
+        attempts.push_back(now);
+        Ok(())
+    }
 }
 
 /// Drops entries older than `ttl`. Called on every access; the maps stay tiny
@@ -193,4 +221,18 @@ impl Sessions {
 fn prune<V>(map: &mut HashMap<String, (V, Instant)>, ttl: Duration) {
     let now = Instant::now();
     map.retain(|_, (_, ts)| now.duration_since(*ts) < ttl);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dcr_rate_limit_caps_state_creating_requests() {
+        let sessions = Sessions::default();
+        for _ in 0..MAX_DCR_REGISTRATIONS_PER_WINDOW {
+            assert!(sessions.allow_dcr_registration().is_ok());
+        }
+        assert!(sessions.allow_dcr_registration().is_err());
+    }
 }

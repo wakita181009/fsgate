@@ -122,7 +122,7 @@ impl Notes {
         }
 
         let updated = content.replacen(old, new, 1);
-        self.atomic_write(&path, &updated)
+        self.atomic_write_if_unchanged(&path, &content, &updated)
     }
 
     /// Lists regular files under an optional relative prefix, returning paths
@@ -204,13 +204,36 @@ impl Notes {
         Ok(())
     }
 
-    /// Atomic write: temp file in the same directory, then rename over target.
-    fn atomic_write(&self, path: &Path, content: &str) -> Result<()> {
+    /// Optimistic compare-and-swap for note updates. The replacement is prepared
+    /// in the same directory, then the target is re-read immediately before the
+    /// atomic rename. If an editor changed it since `patch` read the source, the
+    /// temp file is discarded and the caller must read and retry.
+    fn atomic_write_if_unchanged(&self, path: &Path, expected: &str, content: &str) -> Result<()> {
         let dir = path.parent().unwrap_or(&self.root);
         let tmp = dir.join(format!(".fsgate-tmp-{}", random_token()));
         fs::write(&tmp, content)
             .with_context(|| format!("cannot write temp for {}", path.display()))?;
-        fs::rename(&tmp, path).with_context(|| format!("cannot finalize {}", path.display()))?;
+
+        let current = match fs::read(path) {
+            Ok(current) => current,
+            Err(err) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(err)
+                    .with_context(|| format!("cannot re-read {} before update", path.display()));
+            }
+        };
+        if current != expected.as_bytes() {
+            let _ = fs::remove_file(&tmp);
+            bail!(
+                "{}: update conflict; the file changed while it was being patched; read it again and retry",
+                path.display()
+            );
+        }
+
+        if let Err(err) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err).with_context(|| format!("cannot finalize {}", path.display()));
+        }
         Ok(())
     }
 }
@@ -258,6 +281,23 @@ mod tests {
         assert_eq!(notes.read("n.md").unwrap(), "one 2 one");
         // Missing old_str.
         assert!(notes.patch("n.md", "absent", "X").is_err());
+    }
+
+    #[test]
+    fn patch_refuses_to_overwrite_a_concurrent_edit() {
+        let (notes, _dir) = temp_notes();
+        notes.create("n.md", "before").unwrap();
+        let path = notes.resolve_existing("n.md").unwrap();
+
+        // Simulate an editor changing the file after patch read its source but
+        // before the prepared replacement is committed.
+        fs::write(&path, "external edit").unwrap();
+        let err = notes
+            .atomic_write_if_unchanged(&path, "before", "after")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("update conflict"));
+        assert_eq!(notes.read("n.md").unwrap(), "external edit");
     }
 
     #[test]
