@@ -1,10 +1,10 @@
 mod app;
 mod auth;
 mod config;
+mod credentials;
 mod mcp;
 mod notes;
 mod oauth;
-mod state;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,14 +21,11 @@ use crate::notes::Notes;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "fsgate=info,tower_http=info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "fsgate=info".into()))
         .init();
 
     let config = Config::from_env().context("invalid configuration")?;
-    let creds = state::load(&config.state_dir).context("cannot load credential state")?;
+    let creds = credentials::load(&config.state_dir).context("cannot load credential state")?;
 
     enforce_fail_closed(&config, &creds)?;
 
@@ -59,7 +56,7 @@ async fn main() -> Result<()> {
 /// unusable by design. Enrolling the first passkey requires the recovery
 /// password, so refuse to start when neither exists — otherwise fsgate would be
 /// reachable with no way to ever authenticate the owner.
-fn enforce_fail_closed(config: &Config, creds: &state::Credentials) -> Result<()> {
+fn enforce_fail_closed(config: &Config, creds: &credentials::Credentials) -> Result<()> {
     if !creds.has_owner_verifier() && config.oauth_password.is_none() {
         anyhow::bail!(
             "fail-closed: no owner verifier. Set FSGATE_OAUTH_PASSWORD to enroll your first \

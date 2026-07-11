@@ -12,11 +12,11 @@ use webauthn_rs::prelude::{CreationChallengeResponse, Passkey, RegisterPublicKey
 
 use crate::app::AppState;
 use crate::auth::password;
+use crate::credentials::StoredPasskey;
 use crate::oauth::error::{
     OAuthError, bad_request, forbidden, server_error, too_many_requests, unauthorized,
 };
 use crate::oauth::{now_rfc3339, pages};
-use crate::state::StoredPasskey;
 
 pub async fn page() -> Result<Html<String>, OAuthError> {
     pages::enroll_page().map_err(|e| server_error("render enrollment page", e))

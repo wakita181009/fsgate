@@ -9,8 +9,7 @@ use crate::app::AppState;
 use crate::auth::jwt;
 use crate::auth::pkce;
 use crate::auth::session::Refresh;
-use crate::oauth::error::{OAuthError, error, invalid_grant, server_error};
-use axum::http::StatusCode;
+use crate::oauth::error::{OAuthError, bad_request_code, invalid_grant, server_error};
 
 /// Access-token lifetime. Short by design; the refresh token carries longevity.
 const ACCESS_TTL_SECS: u64 = 15 * 60;
@@ -48,8 +47,7 @@ pub async fn token(
     match req.grant_type.as_str() {
         "authorization_code" => authorization_code_grant(&state, req),
         "refresh_token" => refresh_token_grant(&state, req),
-        other => Err(error(
-            StatusCode::BAD_REQUEST,
+        other => Err(bad_request_code(
             "unsupported_grant_type",
             &format!("unsupported grant_type: {other}"),
         )),

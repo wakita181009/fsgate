@@ -5,13 +5,13 @@ use webauthn_rs::Webauthn;
 
 use crate::auth::session::Sessions;
 use crate::config::Config;
-use crate::state::{self, Credentials};
+use crate::credentials::{self, Credentials};
 
 /// Shared, cloneable application state handed to every axum handler.
 ///
 /// Credential mutations (DCR registration, passkey enrollment, refresh-token
 /// rotation) are rare and are guarded by a std `Mutex`; the guard is never held
-/// across an `.await`. Each mutation persists synchronously via `state::save`.
+/// across an `.await`. Each mutation persists synchronously via `credentials::save`.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
@@ -80,7 +80,7 @@ impl AppState {
         let mut next = guard.clone();
         let (out, changed) = f(&mut next);
         if changed {
-            state::save(&self.inner.config.state_dir, &next)?;
+            credentials::save(&self.inner.config.state_dir, &next)?;
             *guard = next;
         }
         Ok(out)

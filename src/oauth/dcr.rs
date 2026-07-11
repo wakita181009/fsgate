@@ -2,12 +2,14 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use url::Url;
 
 use crate::app::AppState;
+use crate::credentials::{Credentials, OAuthClient};
 use crate::oauth::ALLOWED_REDIRECT_HOSTS;
-use crate::state::{Credentials, OAuthClient};
+use crate::oauth::error::{
+    OAuthError, bad_request_code, capacity_exceeded, dcr_rate_limited, server_error,
+};
 
 const MAX_OAUTH_CLIENTS: usize = 64;
 const MAX_REDIRECT_URIS: usize = 4;
@@ -38,12 +40,10 @@ pub struct RegistrationResponse {
     client_name: Option<String>,
 }
 
-type DcrError = (StatusCode, Json<Value>);
-
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegistrationRequest>,
-) -> Result<(StatusCode, Json<RegistrationResponse>), DcrError> {
+) -> Result<(StatusCode, Json<RegistrationResponse>), OAuthError> {
     let redirect_uris = validate(&req)?;
 
     // Registration metadata is idempotent. Claude may retry a DCR request after
@@ -61,12 +61,12 @@ pub async fn register(
     state
         .sessions()
         .allow_dcr_registration()
-        .map_err(rate_limited)?;
+        .map_err(dcr_rate_limited)?;
 
     let client_id = format!("client_{}", uuid::Uuid::new_v4().simple());
     let outcome = state
         .mutate_creds_if(|credentials| register_client(credentials, &client_id, &redirect_uris))
-        .map_err(internal)?;
+        .map_err(|e| server_error("DCR persistence", e))?;
 
     let (status, client_id) = match outcome {
         RegistrationOutcome::Created => {
@@ -76,7 +76,9 @@ pub async fn register(
         // A concurrent identical request won the race. Reuse its id and do not
         // rewrite the state file.
         RegistrationOutcome::Existing(existing) => (StatusCode::CREATED, existing),
-        RegistrationOutcome::Full => return Err(capacity_exceeded()),
+        RegistrationOutcome::Full => {
+            return Err(capacity_exceeded("oauth client registry is full"));
+        }
     };
 
     Ok(response(status, client_id, redirect_uris, req.client_name))
@@ -101,7 +103,7 @@ fn response(
     )
 }
 
-fn validate(req: &RegistrationRequest) -> Result<Vec<String>, DcrError> {
+fn validate(req: &RegistrationRequest) -> Result<Vec<String>, OAuthError> {
     if req
         .client_name
         .as_ref()
@@ -114,7 +116,7 @@ fn validate(req: &RegistrationRequest) -> Result<Vec<String>, DcrError> {
 
 /// Every redirect target must be https and hosted on an allowed Claude domain.
 /// This is the guard against open-redirect-based code theft.
-fn validate_redirect_uris(uris: &[String]) -> Result<Vec<String>, DcrError> {
+fn validate_redirect_uris(uris: &[String]) -> Result<Vec<String>, OAuthError> {
     if uris.is_empty() {
         return Err(invalid("redirect_uris is required and must be non-empty"));
     }
@@ -150,6 +152,12 @@ fn validate_redirect_uris(uris: &[String]) -> Result<Vec<String>, DcrError> {
     normalized.sort();
     normalized.dedup();
     Ok(normalized)
+}
+
+/// 400 `invalid_client_metadata` — the RFC 7591 error code for a malformed
+/// registration request.
+fn invalid(msg: &str) -> OAuthError {
+    bad_request_code("invalid_client_metadata", msg)
 }
 
 fn find_existing_client(state: &AppState, redirect_uris: &[String]) -> Option<String> {
@@ -192,44 +200,6 @@ fn register_client(
         },
     );
     (RegistrationOutcome::Created, true)
-}
-
-fn invalid(msg: &str) -> DcrError {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "invalid_client_metadata", "error_description": msg })),
-    )
-}
-
-fn internal(err: anyhow::Error) -> DcrError {
-    tracing::error!(error = %err, "DCR persistence failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "server_error" })),
-    )
-}
-
-fn rate_limited(retry_after: std::time::Duration) -> DcrError {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(json!({
-            "error": "temporarily_unavailable",
-            "error_description": format!(
-                "too many client registrations; retry in {}s",
-                retry_after.as_secs().max(1)
-            )
-        })),
-    )
-}
-
-fn capacity_exceeded() -> DcrError {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "server_error",
-            "error_description": "oauth client registry is full"
-        })),
-    )
 }
 
 #[cfg(test)]

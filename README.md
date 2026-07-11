@@ -91,8 +91,8 @@ Public HTTPS  (Tailscale Funnel or Cloudflare Tunnel)   ← FSGATE_PUBLIC_ORIGIN
 
 Two things about this diagram matter:
 
-- **A private VPN is not sufficient.** Tailscale's normal tailnet cannot work here, because Anthropic's servers are not on your tailnet. You need Tailscale **Funnel** (public) or an equivalent tunnel.
-- **The passkey is bound to the public origin.** WebAuthn assertions are validated against `FSGATE_PUBLIC_ORIGIN`, and the passkey's RP ID is that origin's host. So you must **enroll the passkey through the tunnel URL**, not through `localhost`, and the tunnel hostname must be stable (Tailscale Funnel gives you one). If the hostname changes, re-enroll.
+- **A private VPN is not sufficient for the *connector call*.** Tailscale's normal tailnet cannot carry Claude's requests, because Anthropic's servers are not on your tailnet. You need Tailscale **Funnel** (public) or an equivalent tunnel for the actual MCP traffic. (Enrollment is different — see below.)
+- **The passkey is bound to the public origin.** WebAuthn assertions are validated against `FSGATE_PUBLIC_ORIGIN`, and the passkey's RP ID is that origin's host. So you must **enroll through the `.ts.net` hostname**, not through `localhost`. Crucially, that hostname is identical whether the server is tailnet-private (`tailscale serve`) or public (`tailscale funnel`), so you can **enroll while it is still private and only then go public** — see [Setup for iPhone](#setup-for-iphone-with-tailscale). The hostname must stay stable; if it changes, re-enroll.
 
 ---
 
@@ -103,7 +103,7 @@ v1 surface. Deliberately small.
 | Tool | Description |
 |---|---|
 | `search_notes(query, limit?)` | Full-text search across the tree |
-| `read_note(path)` | Return frontmatter + body |
+| `read_note(path)` | Return the note's full contents (raw text, frontmatter included) |
 | `list_notes(prefix?)` | List files under a prefix |
 | `create_note(path, content)` | Create a new file (fails if it exists) |
 | `patch_note(path, old_str, new_str)` | Targeted replacement; fails safely if the file changes concurrently |
@@ -148,27 +148,36 @@ cargo build --release
 # binary at ./target/release/fsgate
 ```
 
-## Setup for iPhone
+## Setup for iPhone (with Tailscale)
 
-This is the intended path: run fsgate on an always-on machine at home, expose it
-through a stable public HTTPS hostname, enroll a passkey, then add it in the
-Claude iOS app.
+This is the intended path, and it uses one property of Tailscale that closes a
+real security gap: **your `<machine>.<tailnet>.ts.net` hostname is the same
+whether it is served privately (tailnet-only, via `tailscale serve`) or exposed
+publicly (via `tailscale funnel`).** Because the WebAuthn passkey is bound to
+that *hostname* (the RP ID), a passkey you enroll while the server is
+tailnet-private stays valid after you flip it public.
 
-### 1. Open a stable public tunnel
+So the recommended flow is **enroll privately first, then go public** — the
+enrollment page is never exposed to the internet:
 
-Tailscale Funnel is free on the Personal plan and gives a stable hostname:
+1. Run fsgate on an always-on machine (e.g. a Mac mini), bound to `127.0.0.1`.
+2. Serve it **tailnet-only** and enroll your passkey from your own device.
+3. Only once `credentials.json` holds your passkey (and enrollment has
+   auto-locked), switch the same hostname to **Funnel** to make it reachable by
+   Anthropic's cloud.
 
-```bash
-tailscale funnel --bg 8420
-# → https://your-machine.tailnet-xxxx.ts.net
-```
+### Prerequisites (one-time, in the Tailscale admin console)
 
-Whatever tunnel you use, **the hostname must be stable** — the passkey is bound
-to it.
+- **MagicDNS + HTTPS certificates** enabled for your tailnet — this is what gives
+  `<machine>.<tailnet>.ts.net` a real TLS certificate (required; WebAuthn will
+  not run over an untrusted origin).
+- **Funnel** enabled for this machine in your ACL policy (`nodeAttrs` →
+  `funnel`). Serve needs no special ACL; Funnel does.
 
-### 2. Run fsgate
+### 1. Run fsgate
 
-Point `FSGATE_PUBLIC_ORIGIN` at that exact tunnel URL:
+Point `FSGATE_PUBLIC_ORIGIN` at the final ts.net hostname from the start — the RP
+ID is fixed here and must not change between enrollment and public exposure:
 
 ```bash
 export FSGATE_ROOT="$HOME/Documents/Notes"
@@ -177,22 +186,56 @@ export FSGATE_STATE_DIR="$HOME/.local/state/fsgate"
 export FSGATE_OAUTH_PASSWORD="$(openssl rand -base64 24)"
 echo "$FSGATE_OAUTH_PASSWORD"   # save this — you need it once, to enroll the passkey
 
-./target/release/fsgate
+./target/release/fsgate   # listens on 127.0.0.1:8420
 ```
 
-### 3. Enroll your passkey (once)
+### 2. Serve tailnet-only, then enroll your passkey (once)
 
-Open the enrollment page **through the tunnel URL** — this is what binds the
-passkey to the right origin. On the device that holds your passkey (e.g. your
-iPhone, or a Mac that syncs passkeys via iCloud Keychain):
+Expose the port **inside your tailnet only** — not to the public internet yet:
+
+```bash
+tailscale serve --bg 8420
+# now reachable at https://your-machine.tailnet-xxxx.ts.net
+# ONLY from devices on your tailnet
+```
+
+On a device that is **on your tailnet** and holds your passkey (your iPhone with
+the Tailscale app, or a Mac that syncs passkeys via iCloud Keychain), open the
+enrollment page at that same hostname:
 
 ```
 https://your-machine.tailnet-xxxx.ts.net/enroll
 ```
 
-Enter the `FSGATE_OAUTH_PASSWORD`, then follow the Face ID / Touch ID prompt.
-Enrollment **auto-locks after the first passkey** — adding another requires a
-fresh owner ceremony. Once enrolled, the password becomes a recovery fallback.
+Enter the `FSGATE_OAUTH_PASSWORD`, then follow the Face ID / Touch ID prompt. The
+origin the browser reports (`https://your-machine.tailnet-xxxx.ts.net`) matches
+the RP ID fsgate was configured with, so the ceremony succeeds. Enrollment
+**auto-locks after the first passkey** — adding another requires a fresh owner
+ceremony. Once enrolled, the password becomes a recovery fallback.
+
+> **Why not `localhost`?** The passkey binds to the RP ID derived from
+> `FSGATE_PUBLIC_ORIGIN`. Enrolling from `http://localhost:8420` reports the wrong
+> origin and the registration is rejected. You must enroll from the
+> `.ts.net` hostname — which is exactly why `tailscale serve` (same hostname,
+> private) is used for this step.
+
+### 3. Switch the same hostname to public Funnel
+
+Now that your passkey is enrolled and `/enroll` is self-locked, expose the same
+hostname to the public internet so Anthropic's servers can reach it:
+
+```bash
+tailscale funnel --bg 8420
+# same URL, now publicly reachable: https://your-machine.tailnet-xxxx.ts.net
+```
+
+The hostname (and therefore the RP ID) is unchanged, so your enrolled passkey
+keeps working. Because enrollment happened while the server was tailnet-private,
+`/enroll` was **never exposed to the public internet**.
+
+> To roll back to private, run `tailscale funnel --bg off` (or
+> `tailscale serve reset`). The hostname must stay **stable** across restarts —
+> the passkey is bound to it; if it changes, re-enroll.
 
 ### 4. Add the connector in the Claude iOS app
 
@@ -230,15 +273,11 @@ If `FSGATE_ROOT` is inside iCloud Drive, you **must** mark the folder "Keep Down
 
 Rationale: a single static binary with no runtime dependency is the right shape for something that must stay up for months on a headless machine. No Node version drift, no venv, no `uv`. `scp` the binary, point launchd at it, done. Fewer moving parts is not an aesthetic preference here; it is the reliability argument.
 
-Stack:
-- [`rmcp`](https://crates.io/crates/rmcp) — official Rust MCP SDK; provides the server-side **Streamable HTTP** transport, mounted as a `tower` service on axum
-- [`axum`](https://crates.io/crates/axum) — HTTP framework for the OAuth/WebAuthn endpoints
-- **OAuth 2.1 authorization server, hand-rolled** — `rmcp` ships only OAuth *client* helpers, so the server side (discovery RFC 9728/8414, DCR RFC 7591, `/authorize`, `/token`) is implemented directly in axum
-- [`webauthn-rs`](https://crates.io/crates/webauthn-rs) — passkey (WebAuthn / FIDO2) relying-party: registration and assertion, with sign-counter clone detection and `userVerification: required`
-- [`jsonwebtoken`](https://crates.io/crates/jsonwebtoken) — HS256 access tokens (pure-Rust backend, no native crypto dep)
-- [`argon2`](https://crates.io/crates/argon2) — Argon2id hashing for the recovery password
-- [`serde_norway`](https://crates.io/crates/serde_norway) — YAML frontmatter (the maintained successor to the deprecated `serde_yaml`)
-- Full-text search is currently a dependency-free recursive scan over the tree; `tantivy` is a v2 consideration.
+Built on [`rmcp`](https://crates.io/crates/rmcp) (the official Rust MCP SDK) for the server-side Streamable HTTP transport and [`axum`](https://crates.io/crates/axum) for HTTP. The OAuth 2.1 authorization server is **hand-rolled** — `rmcp` ships only OAuth *client* helpers, so discovery (RFC 9728/8414), DCR (RFC 7591), `/authorize`, and `/token` are implemented directly. See `Cargo.toml` for the full dependency set.
+
+Two v1 behaviors worth knowing:
+- Full-text search is a dependency-free recursive scan over the tree; `tantivy` is a v2 consideration.
+- `read_note` returns the file's raw text (frontmatter is not parsed out in v1); structured frontmatter is a v2 consideration.
 
 ### Endpoints
 

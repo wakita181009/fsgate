@@ -60,14 +60,7 @@ pub async fn page(
                 }
             }
         }
-        Err((status, Json(body))) => {
-            let msg = body
-                .get("error_description")
-                .and_then(Value::as_str)
-                .unwrap_or("invalid request")
-                .to_string();
-            (status, Html(error_page(&msg))).into_response()
-        }
+        Err(err) => (err.status(), Html(error_page(err.message()))).into_response(),
     }
 }
 
