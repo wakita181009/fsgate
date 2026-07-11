@@ -1,0 +1,19 @@
+# Rust
+/target
+*.tmp
+
+# Secrets
+.env
+credentials.json
+*.pem
+*.key
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Tooling output
+/graphify-out
