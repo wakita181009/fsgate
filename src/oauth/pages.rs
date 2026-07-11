@@ -269,7 +269,9 @@ mod xss_probe {
         eprintln!("VULNERABLE={vulnerable}");
         // find the OAUTH line
         for line in html.lines() {
-            if line.contains("const OAUTH") { eprintln!("LINE: {line}"); }
+            if line.contains("const OAUTH") {
+                eprintln!("LINE: {line}");
+            }
         }
         assert!(!vulnerable, "closing script tag not escaped -> XSS");
     }
