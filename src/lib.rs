@@ -17,6 +17,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
+use axum::extract::Request;
+use axum::http::header;
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
 
 use crate::app::AppState;
@@ -84,7 +88,42 @@ pub fn build_router(state: AppState, notes: Arc<Notes>) -> Router {
         .route("/token", post(oauth::token::token))
         .with_state(state);
 
-    oauth_router.merge(mcp_router)
+    oauth_router
+        .merge(mcp_router)
+        .layer(axum::middleware::from_fn(trace_requests))
+}
+
+/// Access log: one line per request (method, path, host, status). Deliberately
+/// logs neither request bodies nor the `Authorization` value, so access tokens,
+/// passwords, and authorization codes never reach the logs — only whether a
+/// bearer token was present.
+async fn trace_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let has_auth = req.headers().contains_key(header::AUTHORIZATION);
+    let resp = next.run(req).await;
+    tracing::info!(
+        %method,
+        %uri,
+        host = %host,
+        accept = %accept,
+        auth = has_auth,
+        status = resp.status().as_u16(),
+        "req"
+    );
+    resp
 }
 
 /// First-run bootstrap of the durable owner anchor. Generates and persists the
