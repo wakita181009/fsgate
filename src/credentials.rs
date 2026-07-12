@@ -121,3 +121,110 @@ fn verify_perms(path: &Path) -> Result<()> {
 fn verify_perms(_path: &Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::random_token;
+
+    fn temp_state_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fsgate-creds-test-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn has_owner_verifier_tracks_passkeys_and_recovery_password() {
+        let mut creds = Credentials::default();
+        assert!(!creds.has_owner_verifier());
+        creds.recovery_password_hash = Some("hash".to_string());
+        assert!(creds.has_owner_verifier());
+    }
+
+    #[test]
+    fn load_returns_defaults_when_file_is_absent() {
+        let dir = temp_state_dir();
+        let loaded = load(&dir).unwrap();
+        assert!(loaded.owner_handle.is_none());
+        assert!(loaded.oauth_clients.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_creates_a_missing_state_dir() {
+        // A state dir that does not exist yet must be created by `load`.
+        let dir = std::env::temp_dir().join(format!("fsgate-creds-mk-{}", random_token()));
+        assert!(!dir.exists());
+        let _ = load(&dir).unwrap();
+        assert!(dir.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_all_fields() {
+        let dir = temp_state_dir();
+        let mut creds = Credentials {
+            owner_handle: Some("owner-42".to_string()),
+            recovery_password_hash: Some("argon2-hash".to_string()),
+            token_signing_key: Some("signing-key".to_string()),
+            ..Credentials::default()
+        };
+        creds.oauth_clients.insert(
+            "client_a".to_string(),
+            OAuthClient {
+                redirect_uris: vec!["https://claude.ai/cb".to_string()],
+            },
+        );
+
+        save(&dir, &creds).unwrap();
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.owner_handle.as_deref(), Some("owner-42"));
+        assert_eq!(loaded.token_signing_key.as_deref(), Some("signing-key"));
+        assert_eq!(loaded.oauth_clients.len(), 1);
+        assert_eq!(
+            loaded.oauth_clients["client_a"].redirect_uris,
+            vec!["https://claude.ai/cb".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_reports_a_corrupt_credentials_file() {
+        let dir = temp_state_dir();
+        std::fs::write(credentials_path(&dir), b"{ not valid json").unwrap();
+        #[cfg(unix)]
+        set_perms(&credentials_path(&dir)).unwrap();
+        let err = load(&dir).unwrap_err().to_string();
+        assert!(err.contains("corrupt"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_the_file_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_state_dir();
+        save(&dir, &Credentials::default()).unwrap();
+        let mode = std::fs::metadata(credentials_path(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, STATE_PERMS);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_world_readable_credentials_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_state_dir();
+        let path = credentials_path(&dir);
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = load(&dir).unwrap_err().to_string();
+        assert!(err.contains("insecure perms"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

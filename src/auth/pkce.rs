@@ -39,4 +39,13 @@ mod tests {
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert!(!verify_s256("wrong-verifier", challenge));
     }
+
+    #[test]
+    fn rejects_a_length_mismatched_challenge() {
+        // A truncated challenge takes the early length-mismatch path.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert!(!verify_s256(verifier, "E9Melhoa2Owv"));
+        // Empty challenge is also a mismatch, never a match.
+        assert!(!verify_s256(verifier, ""));
+    }
 }

@@ -275,4 +275,31 @@ mod xss_probe {
         }
         assert!(!vulnerable, "closing script tag not escaped -> XSS");
     }
+
+    fn params() -> AuthorizeParams {
+        let raw = r#"{"response_type":"code","client_id":"c","redirect_uri":"https://claude.ai/x","code_challenge":"x","code_challenge_method":"S256"}"#;
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn enroll_page_renders_the_recovery_password_form() {
+        let html = enroll_page().unwrap().0;
+        assert!(html.contains("Enroll a passkey"));
+        assert!(html.contains("Recovery password"));
+        // The dependency-free WebAuthn helpers must be inlined into the page.
+        assert!(html.contains("navigator.credentials.create"));
+    }
+
+    #[test]
+    fn authorize_page_shows_the_password_option_only_when_enabled() {
+        let with_pw = authorize_page(&params(), true).unwrap().0;
+        assert!(with_pw.contains("Sign in with password"));
+        assert!(with_pw.contains("const ALLOW_PW = true"));
+
+        // With password auth disabled the password branch of the template is gone.
+        let without_pw = authorize_page(&params(), false).unwrap().0;
+        assert!(!without_pw.contains("Sign in with password"));
+        assert!(without_pw.contains("const ALLOW_PW = false"));
+        assert!(without_pw.contains("Sign in with passkey"));
+    }
 }

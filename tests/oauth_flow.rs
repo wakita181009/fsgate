@@ -137,6 +137,102 @@ async fn token_rejects_unsupported_grant_type() {
     assert_eq!(parse_json(&body)["error"], "unsupported_grant_type");
 }
 
+#[tokio::test]
+async fn authorization_code_grant_reports_each_missing_parameter() {
+    let server = TestServer::new();
+
+    // Each required parameter is checked in turn before the code is looked up.
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (&[("grant_type", "authorization_code")], "code"),
+        (
+            &[("grant_type", "authorization_code"), ("code", "c")],
+            "code_verifier",
+        ),
+        (
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "c"),
+                ("code_verifier", "v"),
+            ],
+            "client_id",
+        ),
+        (
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "c"),
+                ("code_verifier", "v"),
+                ("client_id", "client_test"),
+            ],
+            "redirect_uri",
+        ),
+    ];
+    for (pairs, needle) in cases {
+        let (status, body) = send(&server, post_form("/token", pairs)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{needle}");
+        assert_eq!(parse_json(&body)["error"], "invalid_grant");
+        assert!(
+            parse_json(&body)["error_description"]
+                .as_str()
+                .unwrap()
+                .contains(needle),
+            "expected description to mention {needle}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_token_grant_requires_a_refresh_token() {
+    let server = TestServer::new();
+    let (status, body) = send(
+        &server,
+        post_form("/token", &[("grant_type", "refresh_token")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&body)["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn refresh_token_grant_rejects_a_client_id_mismatch() {
+    let server = TestServer::new();
+    let code = seed_code(&server);
+    // Obtain a genuine refresh token bound to CLIENT_ID.
+    let (_, body) = send(
+        &server,
+        post_form(
+            "/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+            ],
+        ),
+    )
+    .await;
+    let refresh = parse_json(&body)["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Presenting it under a different client_id is rejected.
+    let (status, resp) = send(
+        &server,
+        post_form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "client_other"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&resp)["error"], "invalid_grant");
+}
+
 /// Seeds an authorization code so `/token` can be exercised end-to-end.
 fn seed_code(server: &TestServer) -> String {
     server.state().sessions().put_auth_code(AuthCode {

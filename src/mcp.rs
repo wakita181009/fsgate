@@ -190,3 +190,166 @@ pub fn service(
         http_config,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::auth::random_token;
+
+    fn temp_gate() -> (FsGate, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fsgate-mcp-test-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let notes = Arc::new(Notes::new(&dir).unwrap());
+        (FsGate::new(notes), dir)
+    }
+
+    /// Pulls the first text block out of a tool result via its serde shape, which
+    /// is stable regardless of the internal `ContentBlock` representation.
+    fn text_of(result: &CallToolResult) -> String {
+        let value = serde_json::to_value(result).expect("serialize CallToolResult");
+        value["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn tools_cover_create_read_list_search_and_patch() {
+        let (gate, dir) = temp_gate();
+
+        gate.create_note(Parameters(CreateArgs {
+            path: "a.md".to_string(),
+            content: "alpha keyword".to_string(),
+        }))
+        .await
+        .expect("create succeeds");
+        // Creating over an existing file is an error.
+        assert!(
+            gate.create_note(Parameters(CreateArgs {
+                path: "a.md".to_string(),
+                content: "again".to_string(),
+            }))
+            .await
+            .is_err()
+        );
+
+        let read = gate
+            .read_note(Parameters(ReadArgs {
+                path: "a.md".to_string(),
+            }))
+            .await
+            .expect("read succeeds");
+        assert_eq!(text_of(&read), "alpha keyword");
+        // Reading a missing file surfaces a tool error.
+        assert!(
+            gate.read_note(Parameters(ReadArgs {
+                path: "missing.md".to_string(),
+            }))
+            .await
+            .is_err()
+        );
+
+        let list = gate
+            .list_notes(Parameters(ListArgs { prefix: None }))
+            .await
+            .expect("list succeeds");
+        assert!(text_of(&list).contains("a.md"));
+
+        // limit 0 is clamped up to 1; the keyword still matches.
+        let search = gate
+            .search_notes(Parameters(SearchArgs {
+                query: "KEYWORD".to_string(),
+                limit: Some(0),
+            }))
+            .await
+            .expect("search succeeds");
+        assert!(text_of(&search).contains("a.md"));
+        // A blank query is rejected.
+        assert!(
+            gate.search_notes(Parameters(SearchArgs {
+                query: "   ".to_string(),
+                limit: None,
+            }))
+            .await
+            .is_err()
+        );
+
+        gate.patch_note(Parameters(PatchArgs {
+            path: "a.md".to_string(),
+            old_str: "alpha".to_string(),
+            new_str: "beta".to_string(),
+        }))
+        .await
+        .expect("patch succeeds");
+        let reread = gate
+            .read_note(Parameters(ReadArgs {
+                path: "a.md".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(text_of(&reread), "beta keyword");
+        // A patch whose old_str is absent fails safely.
+        assert!(
+            gate.patch_note(Parameters(PatchArgs {
+                path: "a.md".to_string(),
+                old_str: "absent".to_string(),
+                new_str: "x".to_string(),
+            }))
+            .await
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn get_info_advertises_tools_and_instructions() {
+        let (gate, dir) = temp_gate();
+        let info = gate.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert!(
+            info.instructions
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fsgate")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn to_tool_error_carries_the_cause_message() {
+        let err = to_tool_error(anyhow::anyhow!("some path problem"));
+        assert!(format!("{err:?}").contains("some path problem"));
+    }
+
+    #[test]
+    fn service_allows_the_public_origin_host_and_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use url::Url;
+
+        use crate::config::Config;
+
+        let dir = std::env::temp_dir().join(format!("fsgate-mcp-svc-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            root: dir.clone(),
+            // A host *and* port exercises both allowed-hosts push branches.
+            public_origin: Url::parse("https://fsgate.example:8443").unwrap(),
+            state_dir: dir.clone(),
+            oauth_password: None,
+            allow_password_auth: true,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            mcp_path: "/".to_string(),
+            token_signing_key: None,
+        };
+        let notes = Arc::new(Notes::new(&dir).unwrap());
+        // Building the service assembles the allowed-hosts list; just ensure it
+        // constructs without panicking.
+        let _service = service(notes, &config);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

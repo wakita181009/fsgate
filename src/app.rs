@@ -86,3 +86,86 @@ impl AppState {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use url::Url;
+
+    use super::*;
+    use crate::auth::random_token;
+
+    /// Builds an `AppState` over a throwaway state dir. The returned path must be
+    /// cleaned up by the caller (kept alive for the test's duration).
+    fn state_with_origin(origin: &str) -> (AppState, std::path::PathBuf) {
+        let state_dir = std::env::temp_dir().join(format!("fsgate-app-test-{}", random_token()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let config = Config {
+            root: state_dir.clone(),
+            public_origin: Url::parse(origin).unwrap(),
+            state_dir: state_dir.clone(),
+            oauth_password: None,
+            allow_password_auth: true,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            mcp_path: "/".to_string(),
+            token_signing_key: None,
+        };
+        let webauthn = crate::auth::webauthn::build(&config).unwrap();
+        (
+            AppState::new(config, Credentials::default(), webauthn),
+            state_dir,
+        )
+    }
+
+    #[test]
+    fn origin_strips_a_trailing_slash() {
+        let (state, dir) = state_with_origin("https://fsgate.example/");
+        assert_eq!(state.origin(), "https://fsgate.example");
+        assert_eq!(state.config().mcp_path, "/");
+        // Exercise the accessors handlers depend on.
+        let _ = state.webauthn();
+        let _ = state.sessions();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn with_creds_reads_a_snapshot() {
+        let (state, dir) = state_with_origin("https://fsgate.example");
+        assert!(state.with_creds(|c| c.owner_handle.clone()).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mutate_creds_persists_and_publishes() {
+        let (state, dir) = state_with_origin("https://fsgate.example");
+        state
+            .mutate_creds(|c| c.owner_handle = Some("owner-1".to_string()))
+            .unwrap();
+
+        // In memory.
+        assert_eq!(
+            state.with_creds(|c| c.owner_handle.clone()),
+            Some("owner-1".to_string())
+        );
+        // And on disk: a fresh load sees the same handle.
+        let reloaded = credentials::load(&dir).unwrap();
+        assert_eq!(reloaded.owner_handle.as_deref(), Some("owner-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mutate_creds_if_skips_the_write_when_unchanged() {
+        let (state, dir) = state_with_origin("https://fsgate.example");
+        // changed == false: nothing is persisted, so no credentials.json appears.
+        let out = state.mutate_creds_if(|_| (7, false)).unwrap();
+        assert_eq!(out, 7);
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "a no-op mutation must not write the state file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

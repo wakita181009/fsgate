@@ -26,7 +26,7 @@ use url::Url;
 use fsgate::app::AppState;
 use fsgate::auth::{self, webauthn};
 use fsgate::config::Config;
-use fsgate::credentials::Credentials;
+use fsgate::credentials::{Credentials, OAuthClient};
 use fsgate::notes::Notes;
 
 pub const SIGNING_KEY: &str = "integration-test-signing-key-do-not-ship";
@@ -47,6 +47,12 @@ impl TestServer {
     /// Minimal wiring for router-level tests: owner handle + signing key present
     /// (so the Bearer gate and `/token` can operate), no verifier required.
     pub fn new() -> Self {
+        Self::with_password_auth(true)
+    }
+
+    /// Like `new`, but with control over whether the password fallback is enabled
+    /// — the login page and `/authorize/password` behave differently either way.
+    pub fn with_password_auth(allow_password_auth: bool) -> Self {
         let unique = auth::random_token();
         let root_dir = std::env::temp_dir().join(format!("fsgate-it-root-{unique}"));
         let state_dir = std::env::temp_dir().join(format!("fsgate-it-state-{unique}"));
@@ -58,7 +64,7 @@ impl TestServer {
             public_origin: Url::parse(ORIGIN).expect("parse test origin"),
             state_dir: state_dir.clone(),
             oauth_password: None,
-            allow_password_auth: true,
+            allow_password_auth,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             mcp_path: MCP_PATH.to_string(),
@@ -85,6 +91,35 @@ impl TestServer {
 
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// Registers an OAuth client so `/authorize` requests validate.
+    pub fn register_client(&self, client_id: &str, redirect_uri: &str) {
+        self.state
+            .mutate_creds(|c| {
+                c.oauth_clients.insert(
+                    client_id.to_string(),
+                    OAuthClient {
+                        redirect_uris: vec![redirect_uri.to_string()],
+                    },
+                );
+            })
+            .expect("register client");
+    }
+
+    /// Sets the Argon2 recovery-password hash so the password gates are exercisable.
+    pub fn set_recovery_password(&self, password: &str) {
+        let hash = auth::password::hash(password).expect("hash recovery password");
+        self.state
+            .mutate_creds(|c| c.recovery_password_hash = Some(hash))
+            .expect("persist recovery password");
+    }
+
+    /// Overrides the owner handle (a valid UUID is required by enrollment).
+    pub fn set_owner_handle(&self, handle: &str) {
+        self.state
+            .mutate_creds(|c| c.owner_handle = Some(handle.to_string()))
+            .expect("set owner handle");
     }
 
     /// A fresh router built from the shared state; each request needs its own

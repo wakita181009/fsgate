@@ -131,3 +131,106 @@ pub fn initialize_owner_state(state: &AppState) -> Result<()> {
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    use url::Url;
+
+    use super::*;
+    use crate::auth::password;
+    use crate::auth::random_token;
+
+    fn config(oauth_password: Option<&str>, signing_key: Option<&str>) -> (Config, PathBuf) {
+        let state_dir = std::env::temp_dir().join(format!("fsgate-lib-test-{}", random_token()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config = Config {
+            root: state_dir.clone(),
+            public_origin: Url::parse("https://fsgate.example").unwrap(),
+            state_dir: state_dir.clone(),
+            oauth_password: oauth_password.map(str::to_string),
+            allow_password_auth: true,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            mcp_path: "/".to_string(),
+            token_signing_key: signing_key.map(str::to_string),
+        };
+        (config, state_dir)
+    }
+
+    fn state(config: Config, creds: Credentials) -> AppState {
+        let webauthn = crate::auth::webauthn::build(&config).unwrap();
+        AppState::new(config, creds, webauthn)
+    }
+
+    #[test]
+    fn fail_closed_passes_once_a_verifier_exists() {
+        let (cfg, dir) = config(Some("pw"), None);
+        // A recovery password is a verifier, and password auth is enabled, so the
+        // second guard's `!allow_password_auth` short-circuits to a pass.
+        let creds = Credentials {
+            recovery_password_hash: Some("hash".to_string()),
+            ..Credentials::default()
+        };
+        assert!(enforce_fail_closed(&cfg, &creds).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_owner_state_fills_missing_anchors() {
+        let (cfg, dir) = config(Some("hunter2"), None);
+        let st = state(cfg, Credentials::default());
+
+        initialize_owner_state(&st).unwrap();
+
+        st.with_creds(|c| {
+            assert!(c.owner_handle.is_some(), "owner handle generated");
+            assert!(c.token_signing_key.is_some(), "signing key generated");
+            let hash = c.recovery_password_hash.clone().expect("password hashed");
+            assert!(password::verify("hunter2", &hash));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_owner_state_uses_the_operator_supplied_signing_key() {
+        let (cfg, dir) = config(None, Some("operator-secret"));
+        let st = state(cfg, Credentials::default());
+        initialize_owner_state(&st).unwrap();
+        assert_eq!(
+            st.with_creds(|c| c.token_signing_key.clone()).as_deref(),
+            Some("operator-secret")
+        );
+        // No password configured -> no recovery hash written.
+        assert!(st.with_creds(|c| c.recovery_password_hash.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_owner_state_is_idempotent() {
+        let (cfg, dir) = config(Some("pw"), None);
+        let st = state(cfg, Credentials::default());
+        initialize_owner_state(&st).unwrap();
+        let first = st.with_creds(|c| {
+            (
+                c.owner_handle.clone(),
+                c.token_signing_key.clone(),
+                c.recovery_password_hash.clone(),
+            )
+        });
+
+        // A second run must not overwrite the anchors (short-circuits to Ok).
+        initialize_owner_state(&st).unwrap();
+        let second = st.with_creds(|c| {
+            (
+                c.owner_handle.clone(),
+                c.token_signing_key.clone(),
+                c.recovery_password_hash.clone(),
+            )
+        });
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

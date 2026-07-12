@@ -247,7 +247,158 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    use axum::http::StatusCode;
+
     use super::*;
+    use crate::app::AppState;
+    use crate::auth::random_token;
+    use crate::config::Config;
+    use crate::credentials::{Credentials, OAuthClient};
+
+    const CLIENT_ID: &str = "client_test";
+    const REDIRECT_URI: &str = "https://claude.ai/cb";
+
+    fn state_with_client() -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fsgate-authz-test-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            root: dir.clone(),
+            public_origin: Url::parse("https://fsgate.example").unwrap(),
+            state_dir: dir.clone(),
+            oauth_password: None,
+            allow_password_auth: true,
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            mcp_path: "/".to_string(),
+            token_signing_key: Some("k".to_string()),
+        };
+        let mut creds = Credentials {
+            owner_handle: Some("owner".to_string()),
+            token_signing_key: Some("k".to_string()),
+            ..Credentials::default()
+        };
+        creds.oauth_clients.insert(
+            CLIENT_ID.to_string(),
+            OAuthClient {
+                redirect_uris: vec![REDIRECT_URI.to_string()],
+            },
+        );
+        let webauthn = crate::auth::webauthn::build(&config).unwrap();
+        (AppState::new(config, creds, webauthn), dir)
+    }
+
+    fn valid_params() -> AuthorizeParams {
+        AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id: CLIENT_ID.to_string(),
+            redirect_uri: REDIRECT_URI.to_string(),
+            code_challenge: "challenge".to_string(),
+            code_challenge_method: "S256".to_string(),
+            resource: None,
+            state: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_request_for_a_registered_client() {
+        let (state, dir) = state_with_client();
+        let ctx = validate(&state, &valid_params()).expect("valid request");
+        assert_eq!(ctx.client_id, CLIENT_ID);
+        assert_eq!(ctx.redirect_uri, REDIRECT_URI);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_rejects_bad_response_type_method_and_missing_challenge() {
+        let (state, dir) = state_with_client();
+
+        let mut p = valid_params();
+        p.response_type = "token".to_string();
+        assert_eq!(
+            validate(&state, &p).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut p = valid_params();
+        p.code_challenge_method = "plain".to_string();
+        assert!(validate(&state, &p).is_err());
+
+        let mut p = valid_params();
+        p.code_challenge = String::new();
+        assert!(validate(&state, &p).is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_client_and_redirect_mismatch() {
+        let (state, dir) = state_with_client();
+
+        let mut p = valid_params();
+        p.client_id = "client_unknown".to_string();
+        assert!(validate(&state, &p).is_err());
+
+        let mut p = valid_params();
+        p.redirect_uri = "https://claude.ai/other".to_string();
+        assert!(validate(&state, &p).is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mint_code_appends_the_code_and_optional_state() {
+        let (state, dir) = state_with_client();
+
+        let ctx = AuthorizeContext {
+            client_id: CLIENT_ID.to_string(),
+            redirect_uri: REDIRECT_URI.to_string(),
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            state: None,
+        };
+        let redirect = mint_code_and_redirect(&state, ctx).unwrap();
+        assert!(redirect.starts_with("https://claude.ai/cb?code="));
+        assert!(!redirect.contains("state="));
+
+        let ctx_state = AuthorizeContext {
+            client_id: CLIENT_ID.to_string(),
+            redirect_uri: REDIRECT_URI.to_string(),
+            code_challenge: "challenge".to_string(),
+            resource: Some("https://fsgate.example".to_string()),
+            state: Some("xyz-state".to_string()),
+        };
+        let redirect = mint_code_and_redirect(&state, ctx_state).unwrap();
+        assert!(redirect.contains("code="));
+        assert!(redirect.contains("state=xyz-state"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mint_code_rejects_an_unparseable_redirect_uri() {
+        let (state, dir) = state_with_client();
+        let ctx = AuthorizeContext {
+            client_id: CLIENT_ID.to_string(),
+            redirect_uri: "not a url".to_string(),
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            state: None,
+        };
+        assert!(mint_code_and_redirect(&state, ctx).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn error_page_escapes_html_metacharacters() {
+        let page = error_page("<b>&\"bad\"</b>");
+        assert!(page.contains("&lt;b&gt;&amp;"));
+        assert!(!page.contains("<b>&"));
+        // html_escape is exercised directly too.
+        assert_eq!(html_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
 
     #[test]
     fn authorization_page_escapes_script_terminators_in_oauth_params() {

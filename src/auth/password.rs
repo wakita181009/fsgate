@@ -45,5 +45,17 @@ mod tests {
     #[test]
     fn rejects_malformed_hash() {
         assert!(!verify("secret", "not-a-hash"));
+        assert!(!verify("secret", ""));
+    }
+
+    #[test]
+    fn each_hash_uses_a_fresh_salt() {
+        // Argon2 salts are random, so hashing the same password twice must not
+        // produce identical encoded hashes, yet both must verify.
+        let a = hash("same-password").unwrap();
+        let b = hash("same-password").unwrap();
+        assert_ne!(a, b);
+        assert!(verify("same-password", &a));
+        assert!(verify("same-password", &b));
     }
 }

@@ -314,4 +314,99 @@ mod tests {
         listed.sort();
         assert_eq!(listed, vec!["a.md".to_string(), "b/c.md".to_string()]);
     }
+
+    #[test]
+    fn empty_and_blank_paths_are_rejected() {
+        let (notes, _dir) = temp_notes();
+        // A path that is only slashes trims to empty.
+        assert!(notes.read("/").is_err());
+        assert!(notes.read("").is_err());
+        assert!(notes.create("", "x").is_err());
+    }
+
+    #[test]
+    fn reading_a_directory_is_not_a_regular_file() {
+        let (notes, _dir) = temp_notes();
+        notes.create("dir/inner.md", "hi").unwrap();
+        let err = notes.read("dir").unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn patch_rejects_an_empty_old_str() {
+        let (notes, _dir) = temp_notes();
+        notes.create("n.md", "content").unwrap();
+        let err = notes.patch("n.md", "", "x").unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn list_with_a_file_prefix_returns_just_that_file() {
+        let (notes, _dir) = temp_notes();
+        notes.create("a.md", "x").unwrap();
+        notes.create("sub/b.md", "y").unwrap();
+
+        // A prefix that resolves to a file returns only that file.
+        assert_eq!(notes.list(Some("a.md")).unwrap(), vec!["a.md".to_string()]);
+        // A prefix that resolves to a directory lists its contents.
+        assert_eq!(
+            notes.list(Some("sub")).unwrap(),
+            vec!["sub/b.md".to_string()]
+        );
+        // A blank prefix behaves like no prefix (whole tree).
+        let mut all = notes.list(Some("   ")).unwrap();
+        all.sort();
+        assert_eq!(all, vec!["a.md".to_string(), "sub/b.md".to_string()]);
+    }
+
+    #[test]
+    fn search_respects_the_limit_across_and_within_files() {
+        let (notes, _dir) = temp_notes();
+        // Three matching lines in one file; a limit of 2 truncates mid-file.
+        notes.create("multi.md", "hit\nhit\nhit\n").unwrap();
+        assert_eq!(notes.search("hit", 2).unwrap().len(), 2);
+
+        // Two matching files; a limit of 1 stops before scanning the second.
+        notes.create("one.md", "needle").unwrap();
+        notes.create("two.md", "needle").unwrap();
+        assert_eq!(notes.search("needle", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_skips_non_utf8_files() {
+        let (notes, dir) = temp_notes();
+        notes.create("text.md", "readable needle").unwrap();
+        // A binary file that is not valid UTF-8 must be skipped, not error out.
+        fs::write(dir.join("binary.bin"), [0xff, 0xfe, 0x00, 0xff]).unwrap();
+
+        let hits = notes.search("needle", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "text.md");
+    }
+
+    #[test]
+    fn walk_skips_hidden_entries() {
+        let (notes, dir) = temp_notes();
+        notes.create("visible.md", "x").unwrap();
+        fs::write(dir.join(".hidden.md"), "secret").unwrap();
+        fs::create_dir_all(dir.join(".hidden-dir")).unwrap();
+        fs::write(dir.join(".hidden-dir/inside.md"), "secret").unwrap();
+
+        assert_eq!(notes.list(None).unwrap(), vec!["visible.md".to_string()]);
+        assert!(notes.search("secret", 10).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_symlink_escaping_the_root_is_refused() {
+        let (notes, dir) = temp_notes();
+        // A symlink inside the root pointing outside must not be readable.
+        let outside = std::env::temp_dir().join(format!("fsgate-outside-{}", random_token()));
+        fs::write(&outside, "secret outside").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape.md")).unwrap();
+
+        let err = notes.read("escape.md").unwrap_err().to_string();
+        assert!(err.contains("resolves outside the served root"), "{err}");
+        let _ = fs::remove_file(outside);
+    }
 }

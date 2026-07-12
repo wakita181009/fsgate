@@ -159,3 +159,106 @@ pub fn server_error(context: &str, err: impl std::fmt::Display) -> OAuthError {
     tracing::error!(context, error = %err, "internal error");
     OAuthError::Internal
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn bad_request_maps_to_400_invalid_request() {
+        let err = bad_request("bad input");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "bad input");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn invalid_grant_maps_to_400() {
+        let err = invalid_grant("nope");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        // The rendered Display carries the code for logs.
+        assert!(err.to_string().starts_with("invalid_grant:"));
+    }
+
+    #[test]
+    fn bad_request_code_carries_the_supplied_code() {
+        let err = bad_request_code("unsupported_grant_type", "no such grant");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "no such grant");
+        assert!(err.to_string().starts_with("unsupported_grant_type:"));
+    }
+
+    #[test]
+    fn unauthorized_maps_to_401() {
+        let err = unauthorized("who are you");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.message(), "who are you");
+    }
+
+    #[test]
+    fn forbidden_maps_to_403() {
+        let err = forbidden("not allowed");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.message(), "not allowed");
+    }
+
+    #[test]
+    fn too_many_requests_maps_to_429_with_retry_after_header() {
+        let err = too_many_requests(42);
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(err.message().contains("42s"));
+
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn dcr_rate_limited_floors_retry_after_at_one_second() {
+        // A sub-second remaining duration must still advertise at least 1s.
+        let err = dcr_rate_limited(Duration::from_millis(200));
+        match &err {
+            OAuthError::RateLimited { retry_after, .. } => assert_eq!(*retry_after, 1),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let resp = dcr_rate_limited(Duration::from_secs(90)).into_response();
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("90")
+        );
+    }
+
+    #[test]
+    fn capacity_exceeded_maps_to_503() {
+        let err = capacity_exceeded("registry full");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "registry full");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn server_error_hides_the_cause_behind_a_generic_500() {
+        let err = server_error("while doing X", "secret detail leaked in logs only");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The body/message must never disclose the underlying cause.
+        assert_eq!(err.message(), "internal error");
+        assert_eq!(err.to_string(), "server_error");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

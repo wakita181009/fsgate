@@ -250,6 +250,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_an_overlong_client_name() {
+        let req = RegistrationRequest {
+            redirect_uris: uris(&["https://claude.ai/cb"]),
+            client_name: Some("n".repeat(MAX_CLIENT_NAME_LEN + 1)),
+        };
+        let err = validate(&req).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_accepts_a_bounded_client_name() {
+        let req = RegistrationRequest {
+            redirect_uris: uris(&["https://claude.ai/cb"]),
+            client_name: Some("Claude".to_string()),
+        };
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn redirect_uris_rejecting_userinfo_and_too_many_and_bad_scheme() {
+        // Embedded credentials are an open-redirect smell.
+        assert!(validate_redirect_uris(&uris(&["https://user:pass@claude.ai/cb"])).is_err());
+        // Non-https is refused.
+        assert!(validate_redirect_uris(&uris(&["http://claude.ai/cb"])).is_err());
+        // A disallowed host is refused.
+        assert!(validate_redirect_uris(&uris(&["https://evil.example/cb"])).is_err());
+        // A completely unparseable URI is refused.
+        assert!(validate_redirect_uris(&uris(&["::not a url::"])).is_err());
+        // More than MAX_REDIRECT_URIS entries is refused.
+        let many: Vec<String> = (0..=MAX_REDIRECT_URIS)
+            .map(|i| format!("https://claude.ai/cb/{i}"))
+            .collect();
+        assert!(validate_redirect_uris(&many).is_err());
+        // A subdomain of an allowed host is accepted.
+        assert!(validate_redirect_uris(&uris(&["https://app.claude.ai/cb"])).is_ok());
+    }
+
+    #[test]
     fn client_registry_never_grows_past_its_limit() {
         let mut credentials = Credentials::default();
         for index in 0..MAX_OAUTH_CLIENTS {

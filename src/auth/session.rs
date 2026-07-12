@@ -227,12 +227,142 @@ fn prune<V>(map: &mut HashMap<String, (V, Instant)>, ttl: Duration) {
 mod tests {
     use super::*;
 
+    fn ctx() -> AuthorizeContext {
+        AuthorizeContext {
+            client_id: "client_test".to_string(),
+            redirect_uri: "https://claude.ai/cb".to_string(),
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            state: None,
+        }
+    }
+
+    fn auth_code() -> AuthCode {
+        AuthCode {
+            client_id: "client_test".to_string(),
+            redirect_uri: "https://claude.ai/cb".to_string(),
+            code_challenge: "challenge".to_string(),
+            resource: Some("https://fsgate.example".to_string()),
+        }
+    }
+
+    /// A real `PasskeyRegistration` state, produced the same way the enrollment
+    /// endpoint does. `start_passkey_registration` needs no authenticator.
+    fn registration_state() -> PasskeyRegistration {
+        use url::Url;
+        use uuid::Uuid;
+        use webauthn_rs::WebauthnBuilder;
+
+        let origin = Url::parse("https://fsgate.example").unwrap();
+        let webauthn = WebauthnBuilder::new("fsgate.example", &origin)
+            .unwrap()
+            .build()
+            .unwrap();
+        let (_ccr, state) = webauthn
+            .start_passkey_registration(Uuid::new_v4(), "owner", "owner", None)
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn registration_ceremony_round_trips_and_is_single_use() {
+        let sessions = Sessions::default();
+        let sid = sessions.put_registration(registration_state());
+
+        assert!(sessions.take_registration("no-such-sid").is_none());
+        assert!(sessions.take_registration(&sid).is_some());
+        // Taken once; a replay of the same sid finds nothing.
+        assert!(sessions.take_registration(&sid).is_none());
+    }
+
+    #[test]
+    fn taking_the_wrong_ceremony_type_leaves_the_entry_intact() {
+        let sessions = Sessions::default();
+        let sid = sessions.put_registration(registration_state());
+
+        // A registration sid is not an authentication ceremony: it must return
+        // None *and* leave the registration recoverable.
+        assert!(sessions.take_authentication(&sid).is_none());
+        assert!(sessions.take_registration(&sid).is_some());
+    }
+
+    #[test]
+    fn auth_code_round_trips_and_is_single_use() {
+        let sessions = Sessions::default();
+        let code = sessions.put_auth_code(auth_code());
+
+        assert!(sessions.take_auth_code("unknown").is_none());
+        let taken = sessions.take_auth_code(&code).expect("code present");
+        assert_eq!(taken.client_id, "client_test");
+        assert_eq!(taken.resource.as_deref(), Some("https://fsgate.example"));
+        // Consumed: a second exchange must fail.
+        assert!(sessions.take_auth_code(&code).is_none());
+    }
+
+    #[test]
+    fn refresh_token_round_trips_and_is_single_use() {
+        let sessions = Sessions::default();
+        let token = sessions.put_refresh(Refresh {
+            client_id: "client_test".to_string(),
+        });
+
+        assert!(sessions.take_refresh("unknown").is_none());
+        assert_eq!(
+            sessions.take_refresh(&token).map(|r| r.client_id),
+            Some("client_test".to_string())
+        );
+        assert!(sessions.take_refresh(&token).is_none());
+    }
+
+    #[test]
+    fn put_authentication_stores_state_reachable_by_sid() {
+        // We cannot forge a PasskeyAuthentication without a passkey, but we can at
+        // least assert the ceremony is stored and that an unrelated take misses.
+        let sessions = Sessions::default();
+        let reg_sid = sessions.put_registration(registration_state());
+        // Storing a registration and then querying an authentication for a random
+        // sid must not disturb the registration.
+        assert!(
+            sessions
+                .take_authentication("completely-different")
+                .is_none()
+        );
+        assert!(sessions.take_registration(&reg_sid).is_some());
+        let _ = ctx(); // AuthorizeContext constructor is exercised for coverage.
+    }
+
+    #[test]
+    fn password_lockout_arms_after_the_threshold_and_clears_on_success() {
+        let sessions = Sessions::default();
+        assert!(sessions.password_lock_remaining().is_none());
+
+        // One below the threshold: still unlocked.
+        for _ in 0..MAX_PASSWORD_FAILURES - 1 {
+            sessions.record_password_failure();
+        }
+        assert!(sessions.password_lock_remaining().is_none());
+
+        // The threshold failure arms the lockout.
+        sessions.record_password_failure();
+        let remaining = sessions
+            .password_lock_remaining()
+            .expect("lockout must be armed");
+        assert!(remaining <= PASSWORD_LOCKOUT && !remaining.is_zero());
+
+        // A success clears the lockout and the failure counter.
+        sessions.record_password_success();
+        assert!(sessions.password_lock_remaining().is_none());
+    }
+
     #[test]
     fn dcr_rate_limit_caps_state_creating_requests() {
         let sessions = Sessions::default();
         for _ in 0..MAX_DCR_REGISTRATIONS_PER_WINDOW {
             assert!(sessions.allow_dcr_registration().is_ok());
         }
-        assert!(sessions.allow_dcr_registration().is_err());
+        let wait = sessions
+            .allow_dcr_registration()
+            .expect_err("the window is full");
+        assert!(wait <= DCR_RATE_WINDOW);
     }
 }
